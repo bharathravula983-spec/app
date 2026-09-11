@@ -67,9 +67,16 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Smart Energy AI API", version="0.1.0", lifespan=lifespan)
 
+# Allow local dev + any Vercel deployment URL
+_ALLOWED_ORIGINS = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    os.getenv("FRONTEND_URL", ""),          # set this on Render to your Vercel URL
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=[o for o in _ALLOWED_ORIGINS if o],
+    allow_origin_regex=r"https://.*\.vercel\.app",   # all Vercel preview URLs
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
