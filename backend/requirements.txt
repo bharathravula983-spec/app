@@ -1,0 +1,10 @@
+fastapi>=0.115
+uvicorn[standard]>=0.30
+pandas>=2.2
+numpy>=1.26
+scikit-learn>=1.5
+xgboost>=2.1
+python-multipart>=0.0.9
+pydantic[email]>=2.8
+python-dotenv>=1.0
+twilio>=9.0
