@@ -178,6 +178,8 @@ export default function Dashboard({ user, onLogout }: Props) {
   const [training, setTraining] = useState(false)
   const [error, setError]       = useState<string | null>(null)
 
+  const hasData = !loading && (overview?.rows ?? 0) > 0
+
   const hour = new Date().getHours()
   const greeting = hour < 12 ? 'Good morning' : hour < 17 ? 'Good afternoon' : 'Good evening'
   const firstName = user.name.split(' ')[0]
@@ -679,11 +681,27 @@ export default function Dashboard({ user, onLogout }: Props) {
 
       {/* Page content */}
       <div className="app-content">
-        {tab === 'home'      && <HomeTab />}
-        {tab === 'charts'    && <ChartsTab />}
-        {tab === 'insights'  && <InsightsTab />}
-        {tab === 'assistant' && <AssistantTab />}
-        {tab === 'profile'   && <ProfileTab />}
+        {!hasData && !loading ? (
+          /* ── Upload gate — shown until the user provides data ─────────── */
+          <div className="flex flex-col items-center justify-center h-full px-8 text-center rise-in">
+            <div className="h-20 w-20 rounded-3xl bg-volt/10 border border-volt/30 flex items-center justify-center text-4xl mb-6">
+              📂
+            </div>
+            <h2 className="text-2xl font-bold text-white mb-2">No data yet</h2>
+            <p className="text-sm text-muted mb-8 leading-relaxed max-w-xs">
+              Upload your energy CSV to unlock charts, forecasts, anomaly detection, and AI insights.
+            </p>
+            <UploadWidget onDone={handleDataChanged} />
+          </div>
+        ) : (
+          <>
+            {tab === 'home'      && <HomeTab />}
+            {tab === 'charts'    && <ChartsTab />}
+            {tab === 'insights'  && <InsightsTab />}
+            {tab === 'assistant' && <AssistantTab />}
+            {tab === 'profile'   && <ProfileTab />}
+          </>
+        )}
       </div>
 
       {/* Bottom navigation */}

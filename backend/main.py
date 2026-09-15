@@ -23,7 +23,7 @@ except ImportError:
     pass
 
 import pandas as pd
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.ml.data_gen import generate_synthetic_dataset
@@ -35,34 +35,38 @@ from app.ml.assistant import answer as assistant_answer
 from app.schemas import TrainResponse, CostConfig, AssistantQuestion, RegisterRequest, LoginRequest, PhoneLoginRequest, AuthResponse, OtpSendRequest, OtpVerifyRequest
 from app import auth as auth_store
 
-# --- in-memory session state (stage 2: move to PostgreSQL, per-user) -------
-STATE: dict = {
-    "raw_df": None,        # cleaned raw dataframe (timestamp, energy_consumption, temperature)
-    "feature_df": None,    # engineered features
-    "model_store": None,   # TrainedModelStore
-    "forecast": None,      # last computed forecast
-}
+# --- per-user in-memory session state (keyed by session token) --------------
+_USER_STATES: dict[str, dict] = {}
 
 HORIZON_HOURS = {"day": 24, "week": 24 * 7, "month": 24 * 30}
 
 
-def _ensure_data_loaded():
-    if STATE["raw_df"] is None:
-        _load_sample()
+def _empty_state() -> dict:
+    return {"raw_df": None, "feature_df": None, "model_store": None, "forecast": None}
 
 
-def _load_sample():
+def _get_state(request: Request) -> dict:
+    """Return the per-user STATE dict. New users start with an empty state."""
+    auth_header = request.headers.get("Authorization", "")
+    token = auth_header.removeprefix("Bearer ").strip() if auth_header.startswith("Bearer ") else ""
+    if not token:
+        token = "__anon__"
+    if token not in _USER_STATES:
+        _USER_STATES[token] = _empty_state()
+    return _USER_STATES[token]
+
+
+def _seed_sample(state: dict) -> None:
     df = generate_synthetic_dataset(days=180)
     df["timestamp"] = pd.to_datetime(df["timestamp"])
-    STATE["raw_df"] = df
-    STATE["feature_df"] = None
-    STATE["model_store"] = None
-    STATE["forecast"] = None
+    state["raw_df"] = df
+    state["feature_df"] = None
+    state["model_store"] = None
+    state["forecast"] = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    _load_sample()
     yield
 
 app = FastAPI(title="Smart Energy AI API", version="0.1.0", lifespan=lifespan)
@@ -173,14 +177,15 @@ def root():
 
 
 @app.post("/data/sample")
-def load_sample_data():
+def load_sample_data(request: Request):
     """Reset to the built-in synthetic sample dataset."""
-    _load_sample()
-    return {"message": "Sample dataset loaded", "rows": len(STATE["raw_df"])}
+    state = _get_state(request)
+    _seed_sample(state)
+    return {"message": "Sample dataset loaded", "rows": len(state["raw_df"])}
 
 
 @app.post("/upload")
-async def upload_csv(file: UploadFile = File(...)):
+async def upload_csv(request: Request, file: UploadFile = File(...)):
     if not file.filename.lower().endswith(".csv"):
         raise HTTPException(400, "Only .csv files are supported.")
     contents = await file.read()
@@ -196,23 +201,37 @@ async def upload_csv(file: UploadFile = File(...)):
     except DatasetValidationError as e:
         raise HTTPException(422, str(e))
 
-    STATE["raw_df"] = cleaned
-    STATE["feature_df"] = None
-    STATE["model_store"] = None
-    STATE["forecast"] = None
+    state = _get_state(request)
+
+    # Merge with any existing data (sample or previously uploaded) so history is preserved
+    existing = state["raw_df"]
+    if existing is not None and not existing.empty:
+        merged = pd.concat([existing, cleaned], ignore_index=True)
+        merged["timestamp"] = pd.to_datetime(merged["timestamp"])
+        merged = merged.drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+    else:
+        merged = cleaned
+
+    state["raw_df"] = merged
+    state["feature_df"] = None
+    state["model_store"] = None
+    state["forecast"] = None
 
     return {
-        "message": "Dataset uploaded and cleaned successfully",
-        "rows": len(cleaned),
-        "date_range": [str(cleaned["timestamp"].min()), str(cleaned["timestamp"].max())],
+        "message": "Dataset uploaded and merged successfully",
+        "rows": len(merged),
+        "date_range": [str(merged["timestamp"].min()), str(merged["timestamp"].max())],
         "rows_dropped_bad_timestamp": cleaned.attrs.get("rows_dropped_bad_timestamp", 0),
     }
 
 
 @app.get("/data/overview")
-def data_overview():
-    _ensure_data_loaded()
-    df = STATE["raw_df"]
+def data_overview(request: Request):
+    state = _get_state(request)
+    df = state["raw_df"]
+    if df is None or df.empty:
+        return {"today_usage_kwh": 0.0, "monthly_usage_kwh": 0.0, "rows": 0, "date_range": [None, None]}
+
     df_daily = df.copy()
     df_daily["date"] = df_daily["timestamp"].dt.date
     daily = df_daily.groupby("date")["energy_consumption"].sum()
@@ -229,9 +248,11 @@ def data_overview():
 
 
 @app.get("/data/timeseries")
-def data_timeseries(granularity: str = Query("daily", pattern="^(hourly|daily|weekly|monthly)$"), limit: int = 90):
-    _ensure_data_loaded()
-    df = STATE["raw_df"].copy()
+def data_timeseries(request: Request, granularity: str = Query("daily", pattern="^(hourly|daily|weekly|monthly)$"), limit: int = 90):
+    state = _get_state(request)
+    if state["raw_df"] is None or state["raw_df"].empty:
+        return []
+    df = state["raw_df"].copy()
     if granularity == "hourly":
         out = df[["timestamp", "energy_consumption"]].tail(limit * 24 if limit else 168)
         out["label"] = out["timestamp"].dt.strftime("%Y-%m-%d %H:%M")
@@ -244,38 +265,46 @@ def data_timeseries(granularity: str = Query("daily", pattern="^(hourly|daily|we
 
 
 @app.post("/train", response_model=TrainResponse)
-def train_models():
-    _ensure_data_loaded()
-    feature_df = engineer_features(STATE["raw_df"])
+def train_models(request: Request):
+    state = _get_state(request)
+    feature_df = engineer_features(state["raw_df"])
     if len(feature_df) < 200:
         raise HTTPException(422, "Not enough data to train reliably (need at least ~200 hourly rows).")
-    store = train_and_compare(feature_df, STATE["raw_df"])
-    STATE["feature_df"] = feature_df
-    STATE["model_store"] = store
-    STATE["forecast"] = None
+    store = train_and_compare(feature_df, state["raw_df"])
+    state["feature_df"] = feature_df
+    state["model_store"] = store
+    state["forecast"] = None
 
     return TrainResponse(rows_used=len(feature_df), best_model=store.best_model_name, metrics=store.metrics)
 
 
-def _get_store() -> TrainedModelStore:
-    if STATE["model_store"] is None:
-        train_models()
-    return STATE["model_store"]
+def _get_store(state: dict) -> TrainedModelStore:
+    if state["raw_df"] is None or state["raw_df"].empty:
+        raise HTTPException(422, "No data loaded. Please upload a CSV file first.")
+    if state["model_store"] is None:
+        feature_df = engineer_features(state["raw_df"])
+        store = train_and_compare(feature_df, state["raw_df"])
+        state["feature_df"] = feature_df
+        state["model_store"] = store
+        state["forecast"] = None
+    return state["model_store"]
 
 
 @app.get("/predict")
-def predict(horizon: str = Query("day", pattern="^(day|week|month)$")):
-    store = _get_store()
+def predict(request: Request, horizon: str = Query("day", pattern="^(day|week|month)$")):
+    state = _get_state(request)
+    store = _get_store(state)
     hours = HORIZON_HOURS[horizon]
     forecast = forecast_next(store, hours)
-    STATE["forecast"] = forecast
+    state["forecast"] = forecast
     return {"horizon": horizon, "hours": hours, "forecast": forecast}
 
 
 @app.get("/predict/actual-vs-predicted")
-def actual_vs_predicted():
+def actual_vs_predicted(request: Request):
     """Backtest the best model on the held-out test slice for a visual comparison."""
-    store = _get_store()
+    state = _get_state(request)
+    store = _get_store(state)
     feature_df = store.feature_df
     from app.ml.preprocessing import FEATURE_COLUMNS, TARGET_COLUMN
     split_idx = int(len(feature_df) * 0.8)
@@ -289,41 +318,51 @@ def actual_vs_predicted():
 
 
 @app.get("/anomalies")
-def anomalies():
-    _ensure_data_loaded()
-    return detect_anomalies(STATE["raw_df"])
+def anomalies(request: Request):
+    state = _get_state(request)
+    if state["raw_df"] is None or state["raw_df"].empty:
+        return []
+    return detect_anomalies(state["raw_df"])
 
 
 @app.get("/insights")
-def insights():
-    store = _get_store()
-    forecast = STATE["forecast"] or forecast_next(store, 24)
-    return generate_insights(STATE["raw_df"], forecast)
+def insights(request: Request):
+    state = _get_state(request)
+    if state["raw_df"] is None or state["raw_df"].empty:
+        return []
+    store = _get_store(state)
+    forecast = state["forecast"] or forecast_next(store, 24)
+    return generate_insights(state["raw_df"], forecast)
 
 
 @app.get("/insights/peak-hours")
-def peak_hours_endpoint():
-    _ensure_data_loaded()
-    return peak_hours(STATE["raw_df"], top_n=5)
+def peak_hours_endpoint(request: Request):
+    state = _get_state(request)
+    if state["raw_df"] is None or state["raw_df"].empty:
+        return []
+    return peak_hours(state["raw_df"], top_n=5)
 
 
 @app.post("/cost")
-def cost(config: CostConfig):
-    store = _get_store()
-    forecast = STATE["forecast"] or forecast_next(store, 24 * 30)
-    return cost_summary(STATE["raw_df"], forecast, config.rate_per_kwh, config.fixed_charge)
+def cost(request: Request, config: CostConfig):
+    state = _get_state(request)
+    store = _get_store(state)
+    forecast = state["forecast"] or forecast_next(store, 24 * 30)
+    return cost_summary(state["raw_df"], forecast, config.rate_per_kwh, config.fixed_charge)
 
 
 @app.get("/models/comparison")
-def models_comparison():
-    store = _get_store()
+def models_comparison(request: Request):
+    state = _get_state(request)
+    store = _get_store(state)
     return {"best_model": store.best_model_name, "metrics": store.metrics}
 
 
 @app.post("/assistant")
-def ask_assistant(payload: AssistantQuestion):
-    store = _get_store()
-    forecast = STATE["forecast"] or forecast_next(store, 24)
-    ins = generate_insights(STATE["raw_df"], forecast)
-    reply = assistant_answer(payload.question, STATE["raw_df"], forecast, ins, payload.rate_per_kwh or 8.0)
+def ask_assistant(request: Request, payload: AssistantQuestion):
+    state = _get_state(request)
+    store = _get_store(state)
+    forecast = state["forecast"] or forecast_next(store, 24)
+    ins = generate_insights(state["raw_df"], forecast)
+    reply = assistant_answer(payload.question, state["raw_df"], forecast, ins, payload.rate_per_kwh or 8.0)
     return {"question": payload.question, "answer": reply}

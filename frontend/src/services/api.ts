@@ -1,11 +1,29 @@
 const BASE_URL = import.meta.env.VITE_API_URL || '/api'
 
+function getToken(): string | null {
+  try {
+    const raw = localStorage.getItem('volt_user')
+    return raw ? (JSON.parse(raw) as { token: string }).token : null
+  } catch {
+    return null
+  }
+}
+
+function authHeaders(extra: Record<string, string> = {}): Record<string, string> {
+  const token = getToken()
+  return token ? { Authorization: `Bearer ${token}`, ...extra } : extra
+}
+
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   let res: Response
   try {
     res = await fetch(`${BASE_URL}${path}`, {
-      headers: { 'Content-Type': 'application/json' },
       ...options,
+      headers: {
+        'Content-Type': 'application/json',
+        ...authHeaders(),
+        ...(options?.headers as Record<string, string> | undefined),
+      },
     })
   } catch {
     throw new Error('Cannot reach the server. Make sure the backend is running on port 8080.')
@@ -111,7 +129,11 @@ export const api = {
   upload: async (file: File) => {
     const form = new FormData()
     form.append('file', file)
-    const res = await fetch(`${BASE_URL}/upload`, { method: 'POST', body: form })
+    const res = await fetch(`${BASE_URL}/upload`, {
+      method: 'POST',
+      body: form,
+      headers: authHeaders(),
+    })
     if (!res.ok) throw new Error(await res.text())
     return res.json()
   },
